@@ -191,6 +191,58 @@ class ESP32GPS():
         # Settle
         await asyncio.sleep(0)
 
+
+    async def serial_to_gps_nmea_forwarder(self):
+        """
+        Forward any NMEA sentences received over usb serial to the GPS module.
+
+        The task keeps a small byte buffer because data may arrive in
+        fragments. When a full line ending with CR/LF is assembled we validate 
+        that it looks like an NMEA sentence before writing it to the GNSS UART.
+        """
+        # Check both serial interfaces are set up before starting task.
+        if not (self.serial and hasattr(self.serial, "uart") and
+                self.gps and hasattr(self.gps, "uart")):
+            return
+
+        # Buffer for bytes that have not yet formed a complete line.
+        rx_buf = b""
+
+        while True:
+            try:
+                data = self.serial.uart.read()
+                if data:
+                    # Append new bytes to the buffer.
+                    rx_buf += data
+
+                    # Process every complete line that ends with CR/LF.
+                    while b"\r\n" in rx_buf:
+                        line, rx_buf = rx_buf.split(b"\r\n", 1)
+                        line += b"\r\n"          # restore terminator for validation
+
+                        # -------------------------------------------------
+                        # NMEA validation – keep it simple:
+                        #   * starts with '$'
+                        #   * contains a '*' before the final CR/LF
+                        #   * has at least one character between '$' and '*'
+                        # -------------------------------------------------
+                        if (
+                            line.startswith(b"$") 
+                            and len(line) > 4 
+                            and b"*" in line[3:]
+                        ):
+                            # Forward the raw sentence to the gps module.
+                            self.gps.uart.write(line)
+                        else:
+                            # Not an NMEA sentence – ignore it.
+                            pass
+                # If no data was available, just yield to the event loop.
+            except Exception as e:
+                log(f"[USB→GPS] read/write error: {e}")
+
+            await asyncio.sleep_ms(0)   # cooperative pause
+
+
     def setup_shell_callbacks(self):
         for cmd in ["CFG", "GPS", "RESET", "RESETGPS"]:
             self.shell_callbacks[cmd] = getattr(self, f"cb_{cmd}")
@@ -288,6 +340,8 @@ class ESP32GPS():
         if cfg.ENABLE_GPS:
             self.setup_gps()
             self.tasks.append(asyncio.create_task(self.gps_reader()))
+            # Now start usb serial to gps forwarding as both serial interfaces should be up by now
+            self.tasks.append(asyncio.create_task(self.serial_to_gps_nmea_forwarder()))
             # sender goes with GPS device
             if espnow_mode == "sender":
                 log("ESPNow: sender mode.")
