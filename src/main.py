@@ -16,7 +16,7 @@ sleep_ms(2000)
 # Disable REPL on UART0 to free it for GPS/Serial use 
 # (required for ESP32-C3 and similar boards with Integrated USB-Serial-JTAG Controller, 
 # optional for others)
-dupterm(None, 0) 
+dupterm(None, 0)
 
 log = Logger.getLogger().log
 
@@ -173,9 +173,9 @@ class ESP32GPS():
     async def ntrip_client_read(self):
         """Read data from NTRIP client and write to GPS device."""
         while True:
-            async for data in ntrip_client.iter_data():
-                self.esp32_write_data(data)
-            
+            data = await self.ntrip_client.iter_data()
+            self.esp32_write_data(data)
+
     async def espnow_reader(self):
         """Read from ESPNow in async loop, and send for outputting."""
         discover_peers = getattr(cfg, "ESPNOW_DISCOVER_PEERS", False)
@@ -448,7 +448,7 @@ class ESP32GPS():
             if cfg.ENABLE_GPS and "client" in cfg.NTRIP_MODE:
                 self.ntrip_client = ntrip.Client(cfg.NTRIP_CASTER, cfg.NTRIP_PORT, cfg.NTRIP_MOUNT, cfg.NTRIP_CLIENT_CREDENTIALS)
                 self.tasks.append(asyncio.create_task(self.ntrip_client.run()))
-                self.tasks.append(self.ntrip_client_read())
+                self.tasks.append(asyncio.create_task(self.ntrip_client_read()))
 
         # Wait for shutdown_event signal
         await self.shutdown_event.wait()

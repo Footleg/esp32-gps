@@ -78,6 +78,7 @@ class Base():
                 headers = headers.split(b"\r\n")
                 for line in headers:
                     if line.endswith(b"200 OK"):
+                        log(f"Login Success for {self.host}:{self.port} {self.mount}")
                         break
                 else:
                     # Not valid login
@@ -110,7 +111,7 @@ class Client(Base):
                     # Regular small reads to avoid blocking (RTCM messages are typically < 512 bytes, max 1023)
                     data = await self.reader.read(128)
                     if data:
-                        yield data
+                        return data
                     else:
                         # Stream closed
                         raise OSError
