@@ -1,5 +1,5 @@
 import asyncio
-from os import rename
+from os import rename, dupterm
 from machine import Pin, reset
 from sys import print_exception
 from time import sleep_ms
@@ -10,6 +10,13 @@ try:
     from debug import DEBUG
 except ImportError:
     DEBUG=False
+
+# Wait 2 seconds to allow time to stop script after reset before REPL is disabled
+sleep_ms(2000)   
+# Disable REPL on UART0 to free it for GPS/Serial use 
+# (required for ESP32-C3 and similar boards with Integrated USB-Serial-JTAG Controller, 
+# optional for others)
+dupterm(None, 0) 
 
 log = Logger.getLogger().log
 
@@ -29,6 +36,7 @@ class ESP32GPS():
         self.ntrip_client = None
         self.tasks = []
         self.shell_callbacks = {}
+        self._gps_rx_buf    = b""   # buffer for data coming from the GNSS UART
 
     def gps_reset(self):
         if (
@@ -108,12 +116,66 @@ class ESP32GPS():
         """Callback to run if device is written to (BLE, Serial)"""
         self.gps.uart.write(value)
 
+    def split_nmea_sentences(self, buf: bytes) -> list[str]:
+        """
+        Extract all complete NMEA sentences from buffer.
+
+        A valid sentence:
+            • starts with b'$'
+            • contains a '*' checksum delimiter
+            • ends with CRLF (b'\r\n')
+        The function returns a list of the complete NMEA sentences from the buffer
+        (including the leading '$' but without the trailing CR/LF). 
+        Any incomplete tail is left in the buffer to be consumed on the next call.
+        """
+
+        # Append the new data to existing data in the buffer
+        self._gps_rx_buf += buf
+
+        # Find end of the last complete nmea sentence in the buffer
+        last_crlf = self._gps_rx_buf.rfind(b'\r\n')
+        if last_crlf != -1:
+            # All complete sentences up to that point
+            chunk = self._gps_rx_buf[:last_crlf + 2]
+            # Save the leftover (might be empty or a fragment of the next sentence)
+            self._gps_rx_buf = self._gps_rx_buf[last_crlf + 2 :]
+        else:
+            # No complete sentences yet, keep everything in the buffer
+            return []
+        
+        sentences = []
+        # Keep looping while we can find a full "$…*XX\r\n" pattern
+        while True:
+            # Find the start of a sentence
+            start = chunk.find(b"$")
+            if start == -1:
+                # No start marker – discard everything (garbage)
+                return sentences
+
+            # Look for the end marker after the start
+            end = chunk.find(b"\r\n", start)
+            if end == -1:
+                # No CRLF (shouldn't happen since we split on last CRLF)
+                raise ValueError("Logic error: expected CRLF after start marker")
+
+            # Extract the candidate sentence (including the leading '$')
+            candidate = chunk[start:end]          # b'$GNGGA,...*5A'
+            # Verify that a checksum delimiter exists
+            # TODO: Validate checksum here
+            if b"*" in candidate:
+                sentences.append(candidate.decode("utf-8", "ignore"))
+
+            # Remove the processed sentence and continue
+            chunk = chunk[end + 2 :]
+
+        return sentences
+
     async def ntrip_client_read(self):
         """Read data from NTRIP client and write to GPS device."""
         while True:
             async for data in ntrip_client.iter_data():
                 self.esp32_write_data(data)
-
+            
     async def espnow_reader(self):
         """Read from ESPNow in async loop, and send for outputting."""
         discover_peers = getattr(cfg, "ESPNOW_DISCOVER_PEERS", False)
@@ -165,9 +227,17 @@ class ESP32GPS():
         try:
             if cfg.ENABLE_SERIAL_CLIENT:
                 # Only send a line if the last transmit completed - avoid buffer overflow
-                if self.serial.uart.txdone():
+                if hasattr(self.serial, "uart") and self.serial.uart.txdone():
                     self.serial.uart.write(line)
                     self.serial.uart.flush()
+                elif self.serial.id == 0:
+                    # For boards with an Integrated USB-Serial-JTAG Controller 
+                    # (e.g. ESP32-C3), we can print directly to the console without 
+                    # using a UART. We want to split the buffer into individual NMEA 
+                    # sentences and send each one separately.
+                    for sentence in self.split_nmea_sentences(line):
+                        # Forward the complete NMEA sentence to the serial output
+                        print(sentence)
         except Exception as e:
             log(f"[GPS DATA] USB serial send exception: {print_exception(e)}")
         try:
@@ -313,6 +383,8 @@ class ESP32GPS():
             self.setup_serial()
             if hasattr(self.serial, "uart"):
                 log(f"Serial output enabled (UART{self.serial.id})")
+            elif self.serial.id == 0:
+                log("Serial output via Integrated USB-Serial-JTAG Controller")
             else:
                 # Serial setup didn't create uart for some reason, so turn off serial logging
                 cfg.ENABLE_SERIAL_CLIENT = False
@@ -403,6 +475,7 @@ class ESP32GPS():
 
 if __name__ == "__main__":
     e32gps = ESP32GPS()
+    log("Starting firmware...")
     try:
         loop = asyncio.get_event_loop()
         loop.run_until_complete(e32gps.run())
