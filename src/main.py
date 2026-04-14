@@ -116,23 +116,32 @@ class ESP32GPS():
         """Callback to run if device is written to (BLE, Serial)"""
         self.gps.uart.write(value)
 
+    # -------------------------------------------------------------------------
+    # Helper – split a raw byte stream into individual NMEA sentences.
+    # -------------------------------------------------------------------------
     def split_nmea_sentences(self, buf: bytes) -> list[str]:
         """
-        Extract all complete NMEA sentences from buffer.
+        Extract all complete NMEA sentences from *buf*.
 
         A valid sentence:
             • starts with b'$'
             • contains a '*' checksum delimiter
             • ends with CRLF (b'\r\n')
-        The function returns a list of the complete NMEA sentences from the buffer
-        (including the leading '$' but without the trailing CR/LF). 
-        Any incomplete tail is left in the buffer to be consumed on the next call.
+        The function returns a list of the *payload* part (including the leading '$'
+        but **without** the trailing CR/LF).  Any incomplete tail is left in the
+        buffer and can be fed back on the next read.
+
+        Example
+        -------
+        >>> raw = b'$GNGGA,123.45*5A\r\n$GNGLL,foo*1B\r\npartial'
+        >>> split_nmea_sentences(raw)
+        [b'$GNGGA,123.45*5A', b'$GNGLL,foo*1B']
         """
 
-        # Append the new data to existing data in the buffer
+        # Append new data to the buffer
         self._gps_rx_buf += buf
 
-        # Find end of the last complete nmea sentence in the buffer
+        # Find the last complete line
         last_crlf = self._gps_rx_buf.rfind(b'\r\n')
         if last_crlf != -1:
             # All complete sentences up to that point
@@ -155,8 +164,8 @@ class ESP32GPS():
             # Look for the end marker after the start
             end = chunk.find(b"\r\n", start)
             if end == -1:
-                # No CRLF (shouldn't happen since we split on last CRLF)
-                raise ValueError("Logic error: expected CRLF after start marker")
+                # No CRLF yet → incomplete sentence, keep it for later
+                break
 
             # Extract the candidate sentence (including the leading '$')
             candidate = chunk[start:end]          # b'$GNGGA,...*5A'
@@ -165,8 +174,8 @@ class ESP32GPS():
             if b"*" in candidate:
                 sentences.append(candidate.decode("utf-8", "ignore"))
 
-            # Remove the processed sentence and continue
-            chunk = chunk[end + 2 :]
+            # Move the buffer past the processed sentence and continue
+            chunk = chunk[end + 2 :]                # skip the "\r\n"
 
         return sentences
 
@@ -384,7 +393,7 @@ class ESP32GPS():
             if hasattr(self.serial, "uart"):
                 log(f"Serial output enabled (UART{self.serial.id})")
             elif self.serial.id == 0:
-                log("Serial output via Integrated USB-Serial-JTAG Controller")
+                log("Serial output to usb via jtag")
             else:
                 # Serial setup didn't create uart for some reason, so turn off serial logging
                 cfg.ENABLE_SERIAL_CLIENT = False
