@@ -12,11 +12,12 @@ except ImportError:
     DEBUG=False
 
 # Wait 2 seconds to allow time to stop script after reset before REPL is disabled
-sleep_ms(2000)   
+#sleep_ms(2000)   
+
 # Disable REPL on UART0 to free it for GPS/Serial use 
 # (required for ESP32-C3 and similar boards with Integrated USB-Serial-JTAG Controller, 
 # optional for others)
-dupterm(None, 0)
+#dupterm(None, 0)
 
 log = Logger.getLogger().log
 
@@ -37,6 +38,7 @@ class ESP32GPS():
         self.tasks = []
         self.shell_callbacks = {}
         self._gps_rx_buf    = b""   # buffer for data coming from the GNSS UART
+        self.statusMsg = "Booting up"
 
     def gps_reset(self):
         if (
@@ -73,7 +75,8 @@ class ESP32GPS():
             self.gps = GPS(uart=cfg.GPS_UART, baudrate=cfg.GPS_BAUD_RATE, tx=cfg.GPS_TX_PIN, rx=cfg.GPS_RX_PIN)
         except (AttributeError, ValueError, OSError) as e:
             log(f"Error setting up GPS: {e}")
-            return
+            self.statusMsg = "Failed to set up GPS"
+            return False
         if hasattr(self.gps, "uart"):
             if (cmds := getattr(cfg, "GPS_SETUP_COMMANDS", None)):
                 # Prefix used to filter response messages
@@ -82,6 +85,7 @@ class ESP32GPS():
                     self.gps.write_nmea(cmd, prefix)
                 if hasattr(cfg, "GPS_SETUP_COMMANDS_RESET"):
                     self.gps_reset()
+        return True
 
     def setup_serial(self):
         from devices import Serial
@@ -116,32 +120,23 @@ class ESP32GPS():
         """Callback to run if device is written to (BLE, Serial)"""
         self.gps.uart.write(value)
 
-    # -------------------------------------------------------------------------
-    # Helper – split a raw byte stream into individual NMEA sentences.
-    # -------------------------------------------------------------------------
     def split_nmea_sentences(self, buf: bytes) -> list[str]:
         """
-        Extract all complete NMEA sentences from *buf*.
+        Extract all complete NMEA sentences from buffer.
 
         A valid sentence:
             • starts with b'$'
             • contains a '*' checksum delimiter
             • ends with CRLF (b'\r\n')
-        The function returns a list of the *payload* part (including the leading '$'
-        but **without** the trailing CR/LF).  Any incomplete tail is left in the
-        buffer and can be fed back on the next read.
-
-        Example
-        -------
-        >>> raw = b'$GNGGA,123.45*5A\r\n$GNGLL,foo*1B\r\npartial'
-        >>> split_nmea_sentences(raw)
-        [b'$GNGGA,123.45*5A', b'$GNGLL,foo*1B']
+        The function returns a list of the complete NMEA sentences from the buffer
+        (including the leading '$' but without the trailing CR/LF). 
+        Any incomplete tail is left in the buffer to be consumed on the next call.
         """
 
-        # Append new data to the buffer
+        # Append the new data to existing data in the buffer
         self._gps_rx_buf += buf
 
-        # Find the last complete line
+        # Find end of the last complete nmea sentence in the buffer
         last_crlf = self._gps_rx_buf.rfind(b'\r\n')
         if last_crlf != -1:
             # All complete sentences up to that point
@@ -199,11 +194,11 @@ class ESP32GPS():
 
     async def gps_reader(self):
         # FIXME: Move to code where this task is instantiated
-        if (
-            "server" in getattr(cfg, "NTRIP_MODE", []) or
+        if ( hasattr(self.gps, "uart") and
+            ("server" in getattr(cfg, "NTRIP_MODE", []) or
             getattr(cfg, "ESPNOW_MODE", None) == "sender" or
             hasattr(cfg, "ENABLE_SERIAL_CLIENT") or
-            (self.blue and self.blue.is_connected())
+            (self.blue and self.blue.is_connected()))
         ):
             while True:
                 try:
@@ -213,6 +208,9 @@ class ESP32GPS():
                 except Exception as e:
                     print_exception(e)
                 await asyncio.sleep_ms(0)
+        else:
+            print("No GPS. Nothing to do!")
+            
 
     async def gps_data(self, line):
         """Read GPS data and send to configured outputs.
@@ -393,7 +391,7 @@ class ESP32GPS():
             if hasattr(self.serial, "uart"):
                 log(f"Serial output enabled (UART{self.serial.id})")
             elif self.serial.id == 0:
-                log("Serial output to usb via jtag")
+                log("Serial output via Integrated USB-Serial-JTAG Controller")
             else:
                 # Serial setup didn't create uart for some reason, so turn off serial logging
                 cfg.ENABLE_SERIAL_CLIENT = False
@@ -416,26 +414,31 @@ class ESP32GPS():
             self.tasks.append(asyncio.create_task(sh.run()))
 
         # Expect to receive gps data (from device, or ESPNOW)
-        src_data = True
+        gps_setup_success = True
         espnow_mode = getattr(cfg, "ESPNOW_MODE", None)
         if cfg.ENABLE_GPS:
-            self.setup_gps()
-            self.tasks.append(asyncio.create_task(self.gps_reader()))
-            # Now start usb serial to gps forwarding as both serial interfaces should be up by now
-            self.tasks.append(asyncio.create_task(self.serial_to_gps_nmea_forwarder()))
-            # sender goes with GPS device
-            if espnow_mode == "sender":
-                log("ESPNow: sender mode.")
+            gps_setup_success = self.setup_gps()
+            print(f"GPS setup outcome: {gps_setup_success}")
+            print(f"Status: {self.statusMsg}")
+            if gps_setup_success:
+                self.tasks.append(asyncio.create_task(self.gps_reader()))
+                # Now start usb serial to gps forwarding as both serial interfaces should be up by now
+                self.tasks.append(asyncio.create_task(self.serial_to_gps_nmea_forwarder()))
+                # sender goes with GPS device
+                if espnow_mode == "sender":
+                    log("ESPNow: sender mode.")
+            else:
+                log("No GPS device found. Serial, Bluetooth and NTRIP server output will be disabled.")
         elif espnow_mode == "receiver":
             log("ESPNow: receiver mode.")
             self.tasks.append(asyncio.create_task(self.espnow_reader()))
         else:
             log("No GPS source available. Serial, Bluetooth and NTRIP server output will be disabled.")
-            src_data = False
+            gps_setup_success = False
 
 
         # No point enabling bluetooth if no GPS data to send
-        if src_data and cfg.ENABLE_BLUETOOTH:
+        if gps_setup_success and cfg.ENABLE_BLUETOOTH:
             from blue import Blue
             log("Enabling Bluetooth")
             self.blue = Blue(name=cfg.DEVICE_NAME)
@@ -443,7 +446,7 @@ class ESP32GPS():
             self.blue.write_callback = self.esp32_write_data
 
         # NTRIP needs a network connection
-        if self.net.wifi_connected:
+        if self.net and self.net.wifi_connected:
             if cfg.NTRIP_MODE:
                 import ntrip
             if "caster" in cfg.NTRIP_MODE:
@@ -451,7 +454,7 @@ class ESP32GPS():
                 self.tasks.append(asyncio.create_task(self.ntrip_caster.run()))
                 # Allow Caster to start before Server/Client
                 await asyncio.sleep(2)
-            if src_data and "server" in cfg.NTRIP_MODE:
+            if gps_setup_success and "server" in cfg.NTRIP_MODE:
                 self.ntrip_server = ntrip.Server(cfg.NTRIP_CASTER, cfg.NTRIP_PORT, cfg.NTRIP_MOUNT, cfg.NTRIP_SERVER_CREDENTIALS)
                 self.tasks.append(asyncio.create_task(self.ntrip_server.run()))
             if cfg.ENABLE_GPS and "client" in cfg.NTRIP_MODE:
